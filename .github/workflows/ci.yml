@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  lint-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff bandit
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Security scan (Bandit)
+        run: bandit -r .
+
+      - name: Compile all (syntax check)
+        run: python -m compileall -q .
+
+      - name: Import smoke test
+        run: |
+          python - << 'PY'
+          import rss_portal
+          assert rss_portal.app is not None
+          print('rss_portal import OK')
+          PY

@@ -243,6 +243,9 @@ This repository also includes:
 
 - `docker-compose.yml`: ready-to-use service definition
 - `.env.example`: sample environment variables (copy to `.env` and edit)
+- GitHub Actions:
+  - CI (`.github/workflows/ci.yml`) for lint, security scan, and basic smoke test
+  - Docker Publish (`.github/workflows/docker-publish.yml`) to build and push images on main and tags
 Changelog
 
 - 2025-11-02:
