@@ -1,0 +1,9 @@
+# Ignore local SQLite database
+feeds.db
+
+# Ignore logs directory
+logs/
+
+# Python cache files
+__pycache__/
+*.pyc
