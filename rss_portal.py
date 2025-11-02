@@ -9,6 +9,7 @@ import sqlite3
 import sys  # Import sys to read command-line arguments
 import logging
 import fcntl
+import re
 from logging.handlers import RotatingFileHandler
 from flask import Flask, Response, render_template_string, request, redirect, url_for, g, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -16,7 +17,13 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 # --- Configuration ---
 DATABASE = 'feeds.db'
-FETCH_INTERVAL_SECONDS = 300  # 5 minutes
+# Fetch interval can be configured via env FETCH_INTERVAL_SECONDS or CLI arg [2]. Default: 300 seconds (5 minutes)
+try:
+    FETCH_INTERVAL_SECONDS = int(os.environ.get('FETCH_INTERVAL_SECONDS', '300'))
+    if FETCH_INTERVAL_SECONDS <= 0:
+        FETCH_INTERVAL_SECONDS = 300
+except Exception:
+    FETCH_INTERVAL_SECONDS = 300
 LOG_DIR = 'logs'
 ACCESS_LOG_FILE = os.path.join(LOG_DIR, 'access.log')
 FETCHER_LOCK_FILE = os.path.join(LOG_DIR, 'fetcher.lock')
@@ -28,6 +35,15 @@ try:
 except (IndexError, ValueError):
     # Default to 8080 if no argument is provided or if it's not a valid number
     SERVER_PORT = 8080
+
+# Optional second CLI argument to override fetch interval seconds
+try:
+    if len(sys.argv) > 2:
+        cli_interval = int(sys.argv[2])
+        if cli_interval > 0:
+            FETCH_INTERVAL_SECONDS = cli_interval
+except (ValueError, IndexError):
+    pass
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 # --- End Configuration ---
@@ -71,6 +87,12 @@ def init_db():
                         role TEXT NOT NULL CHECK(role IN ('admin','user'))
                     )
                 ''')
+                db.execute('''
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                ''')
                 # Seed default admin if not exists
                 existing = db.execute('SELECT id FROM users WHERE username=?', ('admin',)).fetchone()
                 if not existing:
@@ -105,6 +127,43 @@ def upgrade_existing_passwords():
     except Exception as e:
         print(f"Password upgrade check failed: {e}")
 
+def ensure_settings_table():
+    """Ensure the 'settings' table exists even for existing databases."""
+    try:
+        db = sqlite3.connect(DATABASE)
+        with db:
+            db.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            ''')
+        db.close()
+    except Exception as e:
+        print(f"Failed to ensure settings table: {e}")
+
+def load_fetch_interval_from_db():
+    """Load fetch interval from DB settings, seeding if missing."""
+    global FETCH_INTERVAL_SECONDS
+    try:
+        db = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+        row = db.execute('SELECT value FROM settings WHERE key=?', ('fetch_interval_seconds',)).fetchone()
+        if row:
+            try:
+                v = int(row['value'])
+                if v > 0:
+                    FETCH_INTERVAL_SECONDS = v
+            except Exception:
+                pass
+        else:
+            # Seed DB with current value
+            with db:
+                db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('fetch_interval_seconds', str(FETCH_INTERVAL_SECONDS)))
+        db.close()
+    except Exception as e:
+        print(f"Failed to load fetch interval setting: {e}")
+
 # --- Background Fetcher ---
 
 def fetch_all_feeds():
@@ -134,25 +193,91 @@ def fetch_all_feeds():
             response = session.get(feed['rss_url'], timeout=15)
             response.raise_for_status()
 
-            # Update the global cache
+            # Preserve original bytes and content-type to avoid encoding issues (e.g., GB2312/GBK)
+            content_bytes = response.content
+            content_type = response.headers.get('Content-Type', 'application/rss+xml')
+            # Try to determine charset (prefer XML prolog)
+            encoding = None
+            # 1) XML prolog
+            head = content_bytes[:2048]
+            try:
+                head_text = head.decode('ascii', errors='ignore')
+                m2 = re.search(r'<\?xml[^>]*encoding=["\']([A-Za-z0-9_\-]+)["\']', head_text)
+                if m2:
+                    encoding = m2.group(1)
+            except Exception:
+                pass
+            # 2) From header if not set
+            if not encoding:
+                ct_lower = content_type.lower()
+                m = re.search(r'charset\s*=\s*(["\']?)([a-z0-9_\-]+)\1', ct_lower)
+                if m:
+                    encoding = m.group(2)
+            # 3) Fallback to requests' guessed encoding
+            if not encoding and getattr(response, 'apparent_encoding', None):
+                encoding = response.apparent_encoding
+            # 4) Fallback to response.encoding
+            if not encoding and response.encoding:
+                encoding = response.encoding
+            if not encoding:
+                encoding = 'utf-8'  # best-effort default
+
+            try:
+                decoded_text = content_bytes.decode(encoding, errors='replace')
+            except Exception:
+                decoded_text = response.text  # last resort
+
+            # Update the global cache with a rich entry
             with g_cache_lock:
-                g_feed_cache[path] = response.text
-            print(f"[{time.ctime()}] Successfully fetched and cached: {path}")
+                g_feed_cache[path] = {
+                    'bytes': content_bytes,
+                    'content_type': content_type,
+                    'encoding': encoding,
+                    'text': decoded_text,
+                    'ts': time.time()
+                }
+            print(f"[{time.ctime()}] Successfully fetched and cached: {path} (encoding={encoding})")
 
         except requests.exceptions.RequestException as e:
             print(f"[{time.ctime()}] ERROR: Failed to fetch {path}: {e}")
             # Optionally update cache with error
             error_xml = f"<rss><channel><title>Proxy Error</title><description>Failed to fetch RSS: {e}</description></channel></rss>"
+            error_bytes = error_xml.encode('utf-8')
             with g_cache_lock:
                 # Only set error if feed isn't already in cache
-                g_feed_cache.setdefault(path, error_xml)
+                g_feed_cache.setdefault(path, {
+                    'bytes': error_bytes,
+                    'content_type': 'application/rss+xml; charset=utf-8',
+                    'encoding': 'utf-8',
+                    'text': error_xml,
+                    'ts': time.time()
+                })
 
 def background_fetcher():
     """A loop that runs in a background thread."""
+    def _current_interval():
+        try:
+            db = sqlite3.connect(DATABASE)
+            db.row_factory = sqlite3.Row
+            row = db.execute('SELECT value FROM settings WHERE key=?', ('fetch_interval_seconds',)).fetchone()
+            db.close()
+            if row:
+                try:
+                    v = int(row['value'])
+                    if 30 <= v <= 86400:
+                        return v
+                except Exception:
+                    pass
+            # Fallback to global
+            return FETCH_INTERVAL_SECONDS
+        except Exception:
+            return FETCH_INTERVAL_SECONDS
+
     while True:
         fetch_all_feeds()
-        print(f"[{time.ctime()}] Next fetch in {FETCH_INTERVAL_SECONDS} seconds...")
-        time.sleep(FETCH_INTERVAL_SECONDS)
+        next_int = _current_interval()
+        print(f"[{time.ctime()}] Next fetch in {next_int} seconds...")
+        time.sleep(next_int)
 
 # --- Web Application (Flask) ---
 
@@ -220,6 +345,8 @@ if not os.path.exists(DATABASE):
 else:
     # Try to upgrade any legacy plaintext passwords
     upgrade_existing_passwords()
+    ensure_settings_table()
+    load_fetch_interval_from_db()
 setup_logging()
 
 @app.teardown_appcontext
@@ -237,112 +364,212 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RSS Proxy Portal</title>
+    <meta name="theme-color" content="#0ea5e9">
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.6; background-color: #f4f7f6; color: #333; max-width: 900px; margin: 20px auto; padding: 20px; }
-        h1, h2 { color: #2a2a2a; }
-        .container { background: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-        .section { padding: 25px; border-bottom: 1px solid #eee; }
-        .section:last-child { border-bottom: none; }
-        form { display: grid; grid-template-columns: 150px 1fr; gap: 15px; align-items: center; }
-        label { font-weight: 600; text-align: right; }
-        input[type="text"], textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
-        textarea { min-height: 80px; font-family: monospace; }
-        .button-container { grid-column: 2; }
-        button { background-color: #007bff; color: white; padding: 10px 18px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
-        button:hover { background-color: #0056b3; }
-        .feed-list ul { list-style: none; padding-left: 0; }
-        .feed-list li { display: flex; justify-content: space-between; align-items: center; background: #fdfdfd; padding: 12px 15px; border: 1px solid #eee; border-radius: 5px; margin-bottom: 10px; }
-        .feed-list a { font-weight: 600; color: #0056b3; text-decoration: none; word-break: break-all; }
-        .feed-list a:hover { text-decoration: underline; }
-        .feed-url { font-family: monospace; font-size: 0.9em; }
-        .delete-form { margin: 0; }
-        .delete-button { background: #dc3545; font-size: 14px; padding: 8px 12px; }
-        .delete-button:hover { background: #c82333; }
+        :root{
+            --bg: #0b1021;
+            --bg-grad-1: #0b1021;
+            --bg-grad-2: #11183a;
+            --surface: #0f172a;
+            --surface-2: #111827;
+            --border: rgba(255,255,255,0.08);
+            --text: #e5e7eb;
+            --muted: #94a3b8;
+            --primary: #0ea5e9;
+            --primary-600: #0284c7;
+            --danger: #ef4444;
+            --danger-600: #dc2626;
+            --success: #22c55e;
+            --card-shadow: 0 8px 24px rgba(0,0,0,0.35);
+        }
+        *{ box-sizing: border-box }
+        body{
+            margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text);
+            background: linear-gradient(120deg, var(--bg-grad-1), var(--bg-grad-2));
+            min-height: 100vh;
+        }
+        .page{ max-width: 1100px; margin: 32px auto; padding: 0 20px; }
+        .nav{
+            display:flex; align-items:center; justify-content:space-between;
+            background: linear-gradient(90deg, #0ea5e9, #6366f1);
+            color:#fff; padding: 14px 18px; border-radius: 16px; box-shadow: var(--card-shadow);
+            position: sticky; top: 16px; backdrop-filter: blur(6px);
+        }
+        .brand{ display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:.3px }
+        .brand .logo{ display:inline-flex; width:28px; height:28px; align-items:center; justify-content:center; background:rgba(255,255,255,0.2); border-radius:8px }
+        .nav a{ color:#fff; text-decoration:none; opacity:.9; margin-left:14px }
+        .nav a:hover{ opacity:1; text-decoration: underline }
+        .role-badge{ margin-left:10px; font-size:.85em; background: rgba(255,255,255,0.2); padding:4px 8px; border-radius:999px }
+
+        .grid{ display:grid; grid-template-columns: 1fr; gap: 18px; margin-top: 22px }
+        @media (min-width: 860px){ .grid{ grid-template-columns: 1.3fr .7fr } }
+
+        .card{ background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02)); border: 1px solid var(--border);
+               border-radius: 14px; box-shadow: var(--card-shadow); overflow: hidden }
+        .card h2{ margin:0; padding:18px 18px 0; font-size: 1.15rem; color:#fff }
+        .card .content{ padding: 18px }
+
+        .subtle{ color: var(--muted) }
+        .muted{ color: var(--muted); font-size: .95em }
+
+        .form{ display:grid; grid-template-columns: 160px 1fr; gap: 14px; align-items: center }
+        .form label{ text-align:right; font-weight:600; color:#cbd5e1 }
+        .input, .textarea{
+            width:100%; background: var(--surface); color: var(--text);
+            border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+            outline: none; transition: border-color .15s ease, box-shadow .15s ease;
+        }
+        .textarea{ min-height:90px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace }
+        .input:focus, .textarea:focus{ border-color: rgba(14,165,233,.7); box-shadow: 0 0 0 3px rgba(14,165,233,.25) }
+
+        .btn{ display:inline-flex; align-items:center; gap:8px; border: none; border-radius: 10px; padding: 10px 14px; cursor:pointer; font-weight:600 }
+        .btn-primary{ background: var(--primary); color:#001b2c }
+        .btn-primary:hover{ background: var(--primary-600) }
+        .btn-secondary{ background: #334155; color:#e2e8f0 }
+        .btn-secondary:hover{ background: #1f2937 }
+        .btn-danger{ background: var(--danger); color:#fff }
+        .btn-danger:hover{ background: var(--danger-600) }
+
+        .feed-grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px }
+        .feed-card{ background: var(--surface-2); border:1px solid var(--border); border-radius: 12px; padding: 14px; box-shadow: var(--card-shadow) }
+        .feed-top{ display:flex; align-items:center; justify-content:space-between; gap:10px }
+        .feed-link{ font-weight:700; color:#93c5fd; text-decoration:none; word-break: break-all }
+        .feed-link:hover{ text-decoration: underline }
+    .feed-url{ margin-top:8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: .9em; color:#cbd5e1; word-break: break-all; overflow-wrap: anywhere; white-space: normal; max-width: 100% }
+        .actions{ display:flex; gap:8px; flex-wrap:wrap }
+
+        .badge{ display:inline-flex; align-items:center; gap:6px; background:#0b1f36; border:1px solid var(--border); color:#bfdbfe; padding:6px 10px; border-radius: 999px; font-size:.85em }
+
+        .alerts{ margin-top: 8px }
+        .alert{ border:1px solid var(--border); background: rgba(34,197,94,0.08); color:#bbf7d0; padding:10px 12px; border-radius: 10px; margin-bottom: 8px }
+        .alert.error{ background: rgba(239,68,68,0.08); color:#fecaca }
+
+        .kicker{ color:#a5b4fc; font-weight:600; letter-spacing:.02em }
+        .small{ font-size:.9em }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="section">
-            <h1>RSS Proxy Portal</h1>
-            {% if current_user.is_authenticated %}
-                <p>Logged in as: <strong>{{ current_user.username }}</strong> ({{ current_user.role }})
-                | <a href="{{ url_for('logout') }}">Logout</a></p>
-            {% else %}
-                <p><a href="{{ url_for('login') }}">Login</a></p>
-            {% endif %}
-            <p>Add a new feed configuration to proxy. The proxy will fetch it every 5 minutes.</p>
+    <div class="page">
+        <div class="nav">
+            <div class="brand">
+                <span class="logo">📰</span>
+                <span>RSS Proxy Portal</span>
+                {% if current_user.is_authenticated %}
+                <span class="role-badge">{{ current_user.username }} · {{ current_user.role }}</span>
+                {% endif %}
+            </div>
+            <div>
+                <a href="{{ url_for('index') }}">Home</a>
+                {% if is_admin %}<a href="{{ url_for('view_logs') }}" target="_blank">Logs</a>{% endif %}
+                {% if is_admin %}<a href="{{ url_for('manage_users') }}">Users</a>{% endif %}
+                {% if is_admin %}<a href="{{ url_for('settings') }}">Settings</a>{% endif %}
+                {% if current_user.is_authenticated %}
+                    <a href="{{ url_for('change_password') }}">Change Password</a>
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                {% else %}
+                    <a href="{{ url_for('login') }}">Login</a>
+                {% endif %}
+            </div>
         </div>
 
-        <div class="section">
-            <h2>Add New Feed</h2>
-            {% if not is_admin %}
-            <p>Only administrators can add feeds. Please login as admin.</p>
-            {% else %}
-            <form action="/add" method="POST">
-                <label for="path_name">Proxy Path:</label>
-                <input type="text" id="path_name" name="path_name" placeholder="e.g., RSS-chip.xml (must be unique)" required>
-                
-                <label for="rss_url">Source RSS URL:</label>
-                <input type="text" id="rss_url" name="rss_url" placeholder="https://example.com/feed.xml" required>
-                
-                <label for="cookie_data">Cookie Data:</label>
-                <textarea id="cookie_data" name="cookie_data" placeholder="Paste raw cookie string, e.g., session=...; user=..."></textarea>
-                
-                <label for="user_agent">User-Agent:</label>
-                <input type="text" id="user_agent" name="user_agent" placeholder="Optional. Defaults to a standard Chrome User-Agent.">
-
-                <div class="button-container">
-                    <button type="submit">Add Feed</button>
-                </div>
-            </form>
-            {% endif %}
-        </div>
-
-        <div class="section feed-list">
-            <h2>Current Feeds</h2>
-            {% if feeds %}
-                <ul>
-                {% for feed in feeds %}
-                    <li>
-                        <div>
-                            <a href="{{ url_for('serve_feed', path_name=feed.path_name) }}" target="_blank">
-                                /feed/{{ feed.path_name }}
-                            </a>
-                            <div class="feed-url" title="Source URL">{{ feed.rss_url }}</div>
-                        </div>
-                        {% if is_admin %}
-                        <form action="/delete" method="POST" class="delete-form" onsubmit="return confirm('Are you sure?');">
-                            <input type="hidden" name="path_name" value="{{ feed.path_name }}">
-                            <button type="submit" class="delete-button">Delete</button>
-                        </form>
-                        {% endif %}
-                    </li>
+        <div class="alerts">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert {% if category=='error' %}error{% endif %}">{{ message }}</div>
                 {% endfor %}
-                </ul>
-            {% else %}
-                <p>No feeds configured yet.</p>
             {% endif %}
+            {% endwith %}
         </div>
 
-        <div class="section">
-            <h2>Access Logs</h2>
-            {% if is_admin %}
-            <p><a href="{{ url_for('view_logs') }}" target="_blank">View access logs</a></p>
-            {% else %}
-            <p>Only administrators can view logs.</p>
-            {% endif %}
+        <div class="grid">
+            <div class="card">
+                <h2>Add New Feed</h2>
+                <div class="content">
+                    {% if not is_admin %}
+                        <div class="muted">Only administrators can add feeds. Please login as admin.</div>
+                    {% else %}
+                        <form class="form" action="/add" method="POST">
+                            <label for="path_name">Proxy Path</label>
+                            <input class="input" type="text" id="path_name" name="path_name" placeholder="e.g., RSS-chip.xml (must be unique)" required>
+
+                            <label for="rss_url">Source RSS URL</label>
+                            <input class="input" type="text" id="rss_url" name="rss_url" placeholder="https://example.com/feed.xml" required>
+
+                            <label for="cookie_data">Cookie Data</label>
+                            <textarea class="textarea" id="cookie_data" name="cookie_data" placeholder="Paste raw cookie string, e.g., session=...; user=..."></textarea>
+
+                            <label for="user_agent">User-Agent</label>
+                            <input class="input" type="text" id="user_agent" name="user_agent" placeholder="Optional. Defaults to a standard Chrome User-Agent.">
+
+                            <div style="grid-column: 2">
+                                <button class="btn btn-primary" type="submit">➕ Add Feed</button>
+                            </div>
+                        </form>
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Current Feeds</h2>
+                <div class="content">
+                    {% if feeds %}
+                        <div class="kicker small">{{ feeds|length }} configured feed(s)</div>
+                        <div class="feed-grid" style="margin-top:10px">
+                        {% for feed in feeds %}
+                            <div class="feed-card">
+                                <div class="feed-top">
+                                    <a class="feed-link" href="{{ url_for('serve_feed', path_name=feed.path_name) }}" target="_blank">/feed/{{ feed.path_name }}</a>
+                                    <div class="actions">
+                                        <button class="btn btn-secondary" type="button" onclick="copyLink('/feed/{{ feed.path_name }}')">📋 Copy</button>
+                                        {% if is_admin %}
+                                        <form action="/delete" method="POST" class="delete-form" onsubmit="return confirm('Delete this feed?');">
+                                            <input type="hidden" name="path_name" value="{{ feed.path_name }}">
+                                            <button type="submit" class="btn btn-danger">🗑️ Delete</button>
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                                <div class="feed-url" title="Source URL">{{ feed.rss_url }}</div>
+                            </div>
+                        {% endfor %}
+                        </div>
+                    {% else %}
+                        <div class="muted">No feeds configured yet.</div>
+                    {% endif %}
+                </div>
+            </div>
         </div>
 
-        <div class="section">
-            <h2>Account</h2>
-            {% if current_user.is_authenticated %}
-                <p><a href="{{ url_for('change_password') }}">Change password</a></p>
-            {% endif %}
-            {% if is_admin %}
-                <p><a href="{{ url_for('manage_users') }}">Manage users</a></p>
-            {% endif %}
+        <div class="card" style="margin-top:18px">
+            <h2>About</h2>
+            <div class="content">
+                <div class="muted">The proxy fetches feeds periodically and serves cached content for quick access.</div>
+                <div style="margin-top:10px" class="badge">⏱️ Fetch interval: {{ fetch_interval_human }}</div>
+            </div>
         </div>
     </div>
+
+    <script>
+        async function copyLink(link){
+            try{
+                await navigator.clipboard.writeText(location.origin + link);
+                showToast('Link copied');
+            }catch(e){
+                alert('Copy failed');
+            }
+        }
+        function showToast(msg){
+            const t = document.createElement('div');
+            t.textContent = msg;
+            t.style.position='fixed'; t.style.bottom='20px'; t.style.right='20px';
+            t.style.background='rgba(14,165,233,0.15)'; t.style.color='#93c5fd'; t.style.border='1px solid rgba(14,165,233,0.4)';
+            t.style.padding='10px 12px'; t.style.borderRadius='10px'; t.style.boxShadow='0 6px 16px rgba(0,0,0,0.35)';
+            document.body.appendChild(t);
+            setTimeout(()=>{ t.remove(); }, 1800);
+        }
+    </script>
 </body>
 </html>
 """
@@ -352,7 +579,86 @@ def index():
     """Serves the admin portal UI."""
     db = get_db()
     feeds = db.execute('SELECT path_name, rss_url FROM feeds ORDER BY path_name').fetchall()
-    return render_template_string(HTML_TEMPLATE, feeds=feeds, is_admin=is_admin())
+    # Humanize interval for display
+    try:
+        s = int(FETCH_INTERVAL_SECONDS)
+        if s < 60:
+            fetch_interval_human = f"{s} seconds"
+        else:
+            fetch_interval_human = f"{s // 60} minutes" if s % 60 == 0 else f"{s // 60}m {s % 60}s"
+    except Exception:
+        fetch_interval_human = "unknown"
+    return render_template_string(HTML_TEMPLATE, feeds=feeds, is_admin=is_admin(), fetch_interval_human=fetch_interval_human)
+
+SETTINGS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Settings</title>
+<style>
+:root{ --bg:#0b1021; --surface:#0f172a; --border:rgba(255,255,255,0.08); --text:#e5e7eb; --muted:#94a3b8; --primary:#0ea5e9; --primary-600:#0284c7 }
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif;background:linear-gradient(120deg,#0b1021,#11183a);padding:40px;margin:0;color:var(--text)}
+.card{background:linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.02));border:1px solid var(--border);padding:24px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:520px;margin:auto}
+label{display:block;margin:12px 0 6px;font-weight:600;color:#cbd5e1}
+input{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--text)}
+input:focus{border-color:rgba(14,165,233,.7);box-shadow:0 0 0 3px rgba(14,165,233,.25)}
+button{margin-top:16px;background:var(--primary);color:#001b2c;border:0;border-radius:10px;padding:10px 18px;cursor:pointer;font-weight:700}
+button:hover{background:var(--primary-600)}
+.msg{margin-top:12px;border:1px solid var(--border);padding:10px 12px;border-radius:10px}
+.hint{color:var(--muted);font-size:.95em;margin-top:8px}
+</style>
+</head>
+<body>
+<div class=card>
+<h2>Settings</h2>
+<form method=post>
+    <label for=fetch_interval_seconds>Fetch interval (seconds)</label>
+    <input id=fetch_interval_seconds name=fetch_interval_seconds type=number min=30 max=86400 value={{ current_interval }} required>
+    <button type=submit>Save</button>
+    <div class=hint>Effective on next cycle. Recommended: 60–600 seconds. Current: {{ current_interval_human }}.</div>
+</form>
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+        {% for category, message in messages %}
+            <div class="msg">{{ message }}</div>
+        {% endfor %}
+    {% endif %}
+{% endwith %}
+</div>
+</body></html>
+"""
+
+@app.route('/settings', methods=['GET','POST'])
+@login_required
+def settings():
+    if not is_admin():
+        flash('Admin privileges required.', 'error')
+        return redirect(url_for('index'))
+    global FETCH_INTERVAL_SECONDS
+    db = get_db()
+    if request.method == 'POST':
+        val = request.form.get('fetch_interval_seconds','').strip()
+        try:
+            new_val = int(val)
+            if new_val < 30 or new_val > 86400:
+                raise ValueError('Out of range')
+            with db:
+                db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('fetch_interval_seconds', str(new_val)))
+            FETCH_INTERVAL_SECONDS = new_val
+            flash('Fetch interval updated.', 'info')
+            return redirect(url_for('settings'))
+        except Exception:
+            flash('Invalid interval. Please enter 30–86400 seconds.', 'error')
+    # Read current value from DB if exists, else use global
+    row = db.execute('SELECT value FROM settings WHERE key=?', ('fetch_interval_seconds',)).fetchone()
+    if row:
+        try:
+            current = int(row['value'])
+        except Exception:
+            current = FETCH_INTERVAL_SECONDS
+    else:
+        current = FETCH_INTERVAL_SECONDS
+    s = int(current)
+    current_human = f"{s} seconds" if s < 60 else (f"{s // 60} minutes" if s % 60 == 0 else f"{s // 60}m {s % 60}s")
+    return render_template_string(SETTINGS_TEMPLATE, current_interval=current, current_interval_human=current_human)
 
 @app.route("/add", methods=["POST"])
 @login_required
@@ -418,52 +724,67 @@ def serve_feed(path_name):
     content = None
     with g_cache_lock:
         content = g_feed_cache.get(path_name)
-    
+
     if content:
-        return Response(content, mimetype='application/rss+xml; charset=utf-8')
+        # Support both legacy str cache and new dict cache
+        if isinstance(content, dict) and 'bytes' in content:
+            ct = content.get('content_type', 'application/rss+xml') or 'application/rss+xml'
+            # Ensure charset present
+            if 'charset' not in ct.lower():
+                base = ct.split(';')[0].strip()
+                enc = content.get('encoding') or 'utf-8'
+                ct = f"{base}; charset={enc}"
+            return Response(content['bytes'], content_type=ct)
+        else:
+            return Response(str(content), mimetype='application/rss+xml; charset=utf-8')
     else:
         # If not in cache, maybe it was just added. Try to fetch it.
         # For a production system, you'd be more patient.
         error_xml = f"<rss><channel><title>Not Found</title><description>Feed '/feed/{path_name}' not found or not yet cached.</description></channel></rss>"
-        return Response(error_xml, status=404, mimetype='application/rss+xml; charset=utf-8')
+        return Response(error_xml, status=404, content_type='application/rss+xml; charset=utf-8')
 
 LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #f4f7f6; color: #333; display: flex; align-items: center; justify-content: center; height: 100vh; }
-        .card { background: #fff; padding: 24px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); width: 360px; }
-        h2 { margin-top: 0; }
-        label { display: block; margin: 12px 0 6px; font-weight: 600; }
-        input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
-        button { margin-top: 16px; width: 100%; background-color: #007bff; color: white; padding: 10px 18px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
-        button:hover { background-color: #0056b3; }
-        .msg { color: #c00; margin-top: 8px; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h2>Login</h2>
-        <form method="POST">
-            <label for="username">Username</label>
-            <input type="text" id="username" name="username" required>
-            <label for="password">Password</label>
-            <input type="password" id="password" name="password" required>
-            <button type="submit">Login</button>
-        </form>
-        {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}
-            {% for category, message in messages %}
-              <div class="msg">{{ message }}</div>
-            {% endfor %}
-          {% endif %}
-        {% endwith %}
-    </div>
-</body>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Login</title>
+        <style>
+                :root{ --bg:#0b1021; --surface:#0f172a; --border:rgba(255,255,255,0.08); --text:#e5e7eb; --muted:#94a3b8; --primary:#0ea5e9; --primary-600:#0284c7 }
+                *{ box-sizing: border-box }
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: linear-gradient(120deg, #0b1021, #11183a); color: var(--text); display: flex; align-items: center; justify-content: center; min-height: 100vh; margin:0 }
+                .card { background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02)); border:1px solid var(--border); padding: 24px; border-radius: 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); width: 360px; }
+                h2 { margin-top: 0; color:#fff }
+                label { display: block; margin: 12px 0 6px; font-weight: 600; color:#cbd5e1 }
+                input { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text); outline:none }
+                input:focus{ border-color: rgba(14,165,233,.7); box-shadow: 0 0 0 3px rgba(14,165,233,.25) }
+                button { margin-top: 16px; width: 100%; background-color: var(--primary); color: #001b2c; padding: 10px 18px; border: none; border-radius: 10px; cursor: pointer; font-weight: 700 }
+                button:hover { background-color: var(--primary-600); }
+                .msg { color: #fecaca; background: rgba(239,68,68,0.08); border:1px solid var(--border); padding:10px 12px; border-radius:10px; margin-top: 10px; }
+                .brand{ display:flex; align-items:center; gap:8px; color:#a5b4fc; margin-bottom:10px }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+                <div class="brand">📰 RSS Proxy Portal</div>
+                <h2>Login</h2>
+                <form method="POST">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" name="username" required>
+                        <label for="password">Password</label>
+                        <input type="password" id="password" name="password" required>
+                        <button type="submit">Login</button>
+                </form>
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                    {% if messages %}
+                        {% for category, message in messages %}
+                            <div class="msg">{{ message }}</div>
+                        {% endfor %}
+                    {% endif %}
+                {% endwith %}
+        </div>
+    </body>
 </html>
 """
 
@@ -526,9 +847,18 @@ def view_logs():
 
 CHANGE_PW_TEMPLATE = """
 <!DOCTYPE html>
-<html lang=\"en\">
-<head><meta charset=\"utf-8\"><title>Change Password</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif;background:#f4f7f6;padding:40px} .card{background:#fff;padding:24px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.05);max-width:420px;margin:auto} label{display:block;margin:12px 0 6px;font-weight:600} input{width:100%;padding:10px;border:1px solid #ddd;border-radius:5px} button{margin-top:16px;background:#007bff;color:#fff;border:0;border-radius:5px;padding:10px 18px;cursor:pointer}</style>
+<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Change Password</title>
+<style>
+:root{ --bg:#0b1021; --surface:#0f172a; --border:rgba(255,255,255,0.08); --text:#e5e7eb; --primary:#0ea5e9; --primary-600:#0284c7 }
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif;background:linear-gradient(120deg,#0b1021,#11183a);padding:40px;margin:0;color:var(--text)}
+.card{background:linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.02));border:1px solid var(--border);padding:24px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:420px;margin:auto}
+label{display:block;margin:12px 0 6px;font-weight:600;color:#cbd5e1}
+input{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--text)}
+input:focus{border-color:rgba(14,165,233,.7);box-shadow:0 0 0 3px rgba(14,165,233,.25)}
+button{margin-top:16px;background:var(--primary);color:#001b2c;border:0;border-radius:10px;padding:10px 18px;cursor:pointer;font-weight:700}
+button:hover{background:var(--primary-600)}
+.msg{margin-top:12px;background:rgba(34,197,94,0.08);color:#bbf7d0;border:1px solid var(--border);padding:10px 12px;border-radius:10px}
+</style>
 </head>
 <body>
 <div class=card>
@@ -586,19 +916,33 @@ def change_password():
 MANAGE_USERS_TEMPLATE = """
 <!DOCTYPE html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><title>Manage Users</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif;background:#f4f7f6;padding:40px} .card{background:#fff;padding:24px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.05);max-width:720px;margin:auto} table{width:100%;border-collapse:collapse} th,td{border:1px solid #eee;padding:8px} label{display:block;margin:8px 0 4px;font-weight:600} input,select{width:100%;padding:8px;border:1px solid #ddd;border-radius:5px} button{margin-top:8px;background:#007bff;color:#fff;border:0;border-radius:5px;padding:8px 14px;cursor:pointer}</style>
+<style>
+:root{ --bg:#0b1021; --surface:#0f172a; --border:rgba(255,255,255,0.08); --text:#e5e7eb; --muted:#94a3b8; --primary:#0ea5e9; --primary-600:#0284c7 }
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif;background:linear-gradient(120deg,#0b1021,#11183a);padding:40px;margin:0;color:var(--text)}
+.card{background:linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.02));border:1px solid var(--border);padding:24px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:820px;margin:auto}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th,td{border:1px solid var(--border);padding:10px;color:#cbd5e1}
+th{background:#0b1f36;color:#bfdbfe}
+label{display:block;margin:8px 0 4px;font-weight:600;color:#cbd5e1}
+input,select{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--text)}
+input:focus,select:focus{border-color:rgba(14,165,233,.7);box-shadow:0 0 0 3px rgba(14,165,233,.25)}
+button{margin-top:10px;background:var(--primary);color:#001b2c;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:700}
+button:hover{background:var(--primary-600)}
+.msg{margin-top:12px;background:rgba(34,197,94,0.08);color:#bbf7d0;border:1px solid var(--border);padding:10px 12px;border-radius:10px}
+.kicker{color:#a5b4fc;font-weight:600}
+</style>
 </head>
 <body>
 <div class=card>
 <h2>Manage Users</h2>
-<h3>Create User</h3>
+<div class=kicker>Create User</div>
 <form method=post>
 <label>Username</label><input name=username required>
 <label>Password</label><input name=password type=password required>
 <label>Role</label><select name=role><option value=user>User</option><option value=admin>Admin</option></select>
 <button type=submit>Create</button>
 </form>
-<h3>Existing Users</h3>
+<div class=kicker style=margin-top:16px>Existing Users</div>
 <table><tr><th>ID</th><th>Username</th><th>Role</th></tr>
 {% for u in users %}<tr><td>{{u.id}}</td><td>{{u.username}}</td><td>{{u.role}}</td></tr>{% endfor %}
 </table>
@@ -646,6 +990,7 @@ def _start_bg():
 if __name__ == "__main__":
     print(f"Starting Flask server on http://0.0.0.0:{SERVER_PORT}")
     print(f"Admin portal running on http://localhost:{SERVER_PORT}")
-    print(f"To use a different port, run: python {sys.argv[0]} [port_number]")
+    print(f"Fetch interval: {FETCH_INTERVAL_SECONDS} seconds")
+    print(f"To use a different port, run: python {sys.argv[0]} [port_number] [fetch_interval_seconds]")
     app.run(host='0.0.0.0', port=SERVER_PORT)
 
