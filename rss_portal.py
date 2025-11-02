@@ -10,6 +10,7 @@ import sys  # Import sys to read command-line arguments
 import logging
 import fcntl
 import re
+import urllib.parse
 from logging.handlers import RotatingFileHandler
 from flask import Flask, Response, render_template_string, request, redirect, url_for, g, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
@@ -46,6 +47,7 @@ except (ValueError, IndexError):
     pass
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+ACCEPT_HEADER = "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7"
 # --- End Configuration ---
 
 # In-memory cache for the RSS content
@@ -185,7 +187,10 @@ def fetch_all_feeds():
         print(f"[{time.ctime()}] Fetching feed: {path}")
         try:
             session = requests.Session()
-            headers = {'User-Agent': feed['user_agent'] or DEFAULT_USER_AGENT}
+            headers = {
+                'User-Agent': (feed['user_agent'] or DEFAULT_USER_AGENT)[:512],
+                'Accept': ACCEPT_HEADER
+            }
             if feed['cookie_data']:
                 headers['Cookie'] = feed['cookie_data']
             
@@ -668,10 +673,23 @@ def add_feed():
         flash('Admin privileges required to add feeds.', 'error')
         return redirect(url_for('index'))
     try:
-        path_name = request.form['path_name']
-        rss_url = request.form['rss_url']
-        cookie_data = request.form['cookie_data']
-        user_agent = request.form['user_agent'] or DEFAULT_USER_AGENT
+        path_name = request.form['path_name'].strip()
+        rss_url = request.form['rss_url'].strip()
+        cookie_data = request.form.get('cookie_data','').strip()
+        user_agent = (request.form.get('user_agent','') or DEFAULT_USER_AGENT)[:512]
+
+        # Basic validation for URL
+        parsed = urllib.parse.urlparse(rss_url)
+        if parsed.scheme not in ('http','https') or not parsed.netloc:
+            flash('Invalid RSS URL. Use http(s) URLs only.', 'error')
+            return redirect(url_for('index'))
+        # Validate proxy path characters (allow letters, digits, dash, underscore, dot, and slashes)
+        if not re.match(r'^[A-Za-z0-9_./-]+$', path_name):
+            flash('Invalid proxy path. Allowed: letters, digits, dash, underscore, dot, and /.', 'error')
+            return redirect(url_for('index'))
+        if len(path_name) > 200:
+            flash('Proxy path too long.', 'error')
+            return redirect(url_for('index'))
         
         db = get_db()
         with db:
@@ -742,6 +760,14 @@ def serve_feed(path_name):
         # For a production system, you'd be more patient.
         error_xml = f"<rss><channel><title>Not Found</title><description>Feed '/feed/{path_name}' not found or not yet cached.</description></channel></rss>"
         return Response(error_xml, status=404, content_type='application/rss+xml; charset=utf-8')
+
+@app.route('/favicon.ico')
+def favicon():
+    # 1x1 transparent GIF
+    gif = (b'GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;')
+    resp = Response(gif, mimetype='image/gif')
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
 
 LOGIN_TEMPLATE = """
 <!DOCTYPE html>
