@@ -238,6 +238,11 @@ export ADMIN_PASSWORD='your-strong-admin-password'
 export FETCH_INTERVAL_SECONDS=300
 docker compose up -d
 ```
+
+This repository also includes:
+
+- `docker-compose.yml`: ready-to-use service definition
+- `.env.example`: sample environment variables (copy to `.env` and edit)
 Changelog
 
 - 2025-11-02:

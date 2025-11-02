@@ -1,0 +1,17 @@
+version: "3.8"
+services:
+  rss-proxy-portal:
+    image: yadiman/rss-proxy-portal:latest
+    container_name: rss-proxy-portal
+    ports:
+      - "8080:8080"
+    volumes:
+      - rss-portal-data:/app
+    environment:
+      SECRET_KEY: ${SECRET_KEY}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      FETCH_INTERVAL_SECONDS: ${FETCH_INTERVAL_SECONDS:-300}
+    restart: always
+
+volumes:
+  rss-portal-data:
