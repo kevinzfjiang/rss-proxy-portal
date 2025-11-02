@@ -1,28 +1,25 @@
 RSS Proxy Portal
 
-A simple, self-hosted web portal to fetch and proxy restricted RSS feeds.
+A self-hosted web portal to fetch and proxy restricted RSS feeds.
 
 This application helps when RSS feeds are protected by IP, require login cookies, or check for a specific User-Agent.
 
 It runs a lightweight web server that:
 
-- Fetches these restricted feeds in the background from a server that does have access (e.g., your home server).
-- Provides a simple web UI to add, manage, and delete feeds.
-- Serves the cached RSS content at a new, simple, public URL (e.g., /feed/my-feed.xml) that any RSS reader can use.
+- Fetches restricted feeds in the background from a server that does have access (e.g., your home server).
+- Provides a modern web UI to add, manage, and delete feeds.
+- Serves the cached RSS content at a new, simple URL (e.g., /feed/my-feed.xml) that any RSS reader can use.
 
 Features
 
-Simple Web UI: A clean interface (built with Flask) to add and remove feeds.
-
-Background Fetching: A background thread automatically fetches all feeds every 5 minutes.
-
-Custom Credentials: Set custom cookies and User-Agent strings for each feed individually.
-
-Custom URL Paths: Define your own proxy path (e.g., RSS-chip.xml) for each feed.
-
-Persistent Storage: Uses a simple SQLite database (feeds.db) to store your configurations.
-
-Containerized: Includes a Dockerfile for easy deployment.
+- Modern UI: Refreshed dark theme with card layout, better forms, copy-to-clipboard links.
+- Background Fetching: Configurable interval; fetches all feeds periodically.
+- Custom Credentials: Set cookies and User-Agent strings per feed.
+- Custom URL Paths: Define your own proxy path (e.g., RSS-chip.xml) for each feed.
+- Persistent Storage: SQLite database (feeds.db) stores configurations and settings.
+- Settings Page: Admin UI to configure fetch interval, persisted to DB.
+- Robust Encoding Handling: Preserves original bytes and sets proper charset to avoid garbled text (e.g., Chinese GBK/GB2312, UTF-8).
+- Containerized: Includes a Dockerfile for easy deployment.
 
 Authentication & Roles
 
@@ -63,6 +60,7 @@ docker run -d \
   -v rss-portal-data:/app \
   -e SECRET_KEY=$(openssl rand -hex 32) \
   -e ADMIN_PASSWORD='your-strong-admin-password' \
+  -e FETCH_INTERVAL_SECONDS=300 \
   --name my-rss-proxy \
   --restart always \
   rss-proxy-portal
@@ -108,6 +106,11 @@ export SECRET_KEY=$(python -c 'import secrets; print(secrets.token_hex(32))')
 python rss_portal.py
 # You can also specify a port:
 # python rss_portal.py 8000
+# You can also specify fetch interval (seconds) as an optional second argument:
+# python rss_portal.py 8080 120
+# Or via environment variable:
+# export FETCH_INTERVAL_SECONDS=120
+# python rss_portal.py
 ```
 
 
@@ -152,6 +155,21 @@ Configuration & Production notes
 
 - Ensure SECRET_KEY and ADMIN_PASSWORD are set via environment variables.
 
+Settings & Configuration
+
+- Fetch interval can be configured in three ways:
+  1) Environment variable: `FETCH_INTERVAL_SECONDS` (in seconds)
+  2) CLI argument: `python rss_portal.py [port] [fetch_interval_seconds]`
+  3) Admin UI: Settings page at `http://localhost:8080/settings` (persists to DB)
+
+- The background fetcher reads the latest interval from the DB each cycle, so changes in Settings take effect across processes.
+
+Encoding Handling
+
+- The proxy preserves the source bytes and sets the response `Content-Type` with the correct `charset`.
+- Charset detection order: XML prolog `<?xml ... encoding="..."?>` > response header > apparent encoding > requests' encoding; default `utf-8`.
+- This avoids Chinese content being garbled when upstream serves `text/xml` without explicit charset.
+
 Password reset
 
 If you forget the admin password, you can reset it directly in the SQLite database. Then log in once to trigger an automatic upgrade to a secure hash, or change it via the UI.
@@ -163,3 +181,12 @@ sqlite3 feeds.db "update users set password='admin' where username='admin';"
 ```
 
 After resetting, log in with admin/admin and immediately change the password at http://localhost:8080/change_password.
+
+Changelog
+
+- 2025-11-02:
+  - UI overhaul (dark theme, improved forms and feed cards, link copy button)
+  - Settings page to configure fetch interval (persisted to DB)
+  - Fetch interval configurable via env/CLI/UI and read per-cycle from DB
+  - Encoding fix: preserve bytes, prefer XML prolog encoding, set charset in response
+  - Feed card URL overflow fixed
