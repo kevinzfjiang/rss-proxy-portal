@@ -36,6 +36,30 @@ Method 1: Docker (Recommended)
 
 This is the easiest and most reliable way to run the portal, as it bundles all dependencies.
 
+Option A: Use the prebuilt image from Docker Hub
+
+Pull the image:
+
+```bash
+docker pull yadiman/rss-proxy-portal:latest
+```
+
+Run the Container:
+
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -v rss-portal-data:/app \
+  -e SECRET_KEY=$(openssl rand -hex 32) \
+  -e ADMIN_PASSWORD='your-strong-admin-password' \
+  -e FETCH_INTERVAL_SECONDS=300 \
+  --name my-rss-proxy \
+  --restart always \
+  yadiman/rss-proxy-portal:latest
+```
+
+Option B: Build the Image Locally
+
 Build the Image:
 From the directory containing the Dockerfile, run:
 
@@ -182,6 +206,38 @@ sqlite3 feeds.db "update users set password='admin' where username='admin';"
 
 After resetting, log in with admin/admin and immediately change the password at http://localhost:8080/change_password.
 
+Docker Compose Example
+
+You can also use Docker Compose for easier management:
+
+```yaml
+version: "3.8"
+services:
+  rss-proxy-portal:
+    image: yadiman/rss-proxy-portal:latest
+    container_name: rss-proxy-portal
+    ports:
+      - "8080:8080"
+    volumes:
+      - rss-portal-data:/app
+    environment:
+      SECRET_KEY: ${SECRET_KEY}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      FETCH_INTERVAL_SECONDS: ${FETCH_INTERVAL_SECONDS:-300}
+    restart: always
+
+volumes:
+  rss-portal-data:
+```
+
+Start with:
+
+```bash
+export SECRET_KEY=$(openssl rand -hex 32)
+export ADMIN_PASSWORD='your-strong-admin-password'
+export FETCH_INTERVAL_SECONDS=300
+docker compose up -d
+```
 Changelog
 
 - 2025-11-02:
