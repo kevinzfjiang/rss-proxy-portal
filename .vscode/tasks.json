@@ -1,0 +1,34 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run RSS Proxy Portal",
+			"type": "shell",
+			"command": "${config:python.pythonPath}",
+			"args": [
+				"c:\\Users\\Kevin\\Downloads\\codes\\rss-proxy-portal\\rss_portal.py"
+			],
+			"problemMatcher": [
+				"$eslint - stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run RSS Proxy Portal",
+			"type": "shell",
+			"command": "conda",
+			"args": [
+				"run",
+				"-p",
+				"C:\\Users\\Kevin\\scoop\\apps\\anaconda3\\2024.10-1\\App",
+				"--no-capture-output",
+				"python",
+				"c:\\Users\\Kevin\\Downloads\\codes\\rss-proxy-portal\\rss_portal.py"
+			],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		}
+	]
+}

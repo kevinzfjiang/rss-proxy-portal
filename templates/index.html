@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RSS Proxy Portal</title>
+    <meta name="theme-color" content="#0ea5e9">
+    <style>
+        :root{
+            --bg: #0b1021;
+            --bg-grad-1: #0b1021;
+            --bg-grad-2: #11183a;
+            --surface: #0f172a;
+            --surface-2: #111827;
+            --border: rgba(255,255,255,0.08);
+            --text: #e5e7eb;
+            --muted: #94a3b8;
+            --primary: #0ea5e9;
+            --primary-600: #0284c7;
+            --danger: #ef4444;
+            --danger-600: #dc2626;
+            --success: #22c55e;
+            --card-shadow: 0 8px 24px rgba(0,0,0,0.35);
+        }
+        *{ box-sizing: border-box }
+        body{
+            margin:0; padding:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text);
+            background: linear-gradient(120deg, var(--bg-grad-1), var(--bg-grad-2));
+            min-height: 100vh;
+        }
+        .page{ max-width: 1100px; margin: 32px auto; padding: 0 20px; }
+        .nav{
+            display:flex; align-items:center; justify-content:space-between;
+            background: linear-gradient(90deg, #0ea5e9, #6366f1);
+            color:#fff; padding: 14px 18px; border-radius: 16px; box-shadow: var(--card-shadow);
+            position: sticky; top: 16px; backdrop-filter: blur(6px);
+        }
+        .brand{ display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:.3px }
+        .brand .logo{ display:inline-flex; width:28px; height:28px; align-items:center; justify-content:center; background:rgba(255,255,255,0.2); border-radius:8px }
+        .nav a{ color:#fff; text-decoration:none; opacity:.9; margin-left:14px }
+        .nav a:hover{ opacity:1; text-decoration: underline }
+        .role-badge{ margin-left:10px; font-size:.85em; background: rgba(255,255,255,0.2); padding:4px 8px; border-radius:999px }
+
+        .grid{ display:grid; grid-template-columns: 1fr; gap: 18px; margin-top: 22px }
+        @media (min-width: 860px){ .grid{ grid-template-columns: 1.3fr .7fr } }
+
+        .card{ background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02)); border: 1px solid var(--border);
+               border-radius: 14px; box-shadow: var(--card-shadow); overflow: hidden }
+        .card h2{ margin:0; padding:18px 18px 0; font-size: 1.15rem; color:#fff }
+        .card .content{ padding: 18px }
+
+        .subtle{ color: var(--muted) }
+        .muted{ color: var(--muted); font-size: .95em }
+
+        .form{ display:grid; grid-template-columns: 160px 1fr; gap: 14px; align-items: center }
+        .form label{ text-align:right; font-weight:600; color:#cbd5e1 }
+        .input, .textarea{
+            width:100%; background: var(--surface); color: var(--text);
+            border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+            outline: none; transition: border-color .15s ease, box-shadow .15s ease;
+        }
+        .textarea{ min-height:90px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace }
+        .input:focus, .textarea:focus{ border-color: rgba(14,165,233,.7); box-shadow: 0 0 0 3px rgba(14,165,233,.25) }
+
+        .btn{ display:inline-flex; align-items:center; gap:8px; border: none; border-radius: 10px; padding: 10px 14px; cursor:pointer; font-weight:600 }
+        .btn-primary{ background: var(--primary); color:#001b2c }
+        .btn-primary:hover{ background: var(--primary-600) }
+        .btn-secondary{ background: #334155; color:#e2e8f0 }
+        .btn-secondary:hover{ background: #1f2937 }
+        .btn-danger{ background: var(--danger); color:#fff }
+        .btn-danger:hover{ background: var(--danger-600) }
+
+        .feed-grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px }
+        .feed-card{ background: var(--surface-2); border:1px solid var(--border); border-radius: 12px; padding: 14px; box-shadow: var(--card-shadow) }
+        .feed-top{ display:flex; align-items:center; justify-content:space-between; gap:10px }
+        .feed-link{ font-weight:700; color:#93c5fd; text-decoration:none; word-break: break-all }
+        .feed-link:hover{ text-decoration: underline }
+    .feed-url{ margin-top:8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: .9em; color:#cbd5e1; word-break: break-all; overflow-wrap: anywhere; white-space: normal; max-width: 100% }
+        .actions{ display:flex; gap:8px; flex-wrap:wrap }
+
+        .badge{ display:inline-flex; align-items:center; gap:6px; background:#0b1f36; border:1px solid var(--border); color:#bfdbfe; padding:6px 10px; border-radius: 999px; font-size:.85em }
+
+        .alerts{ margin-top: 8px }
+        .alert{ border:1px solid var(--border); background: rgba(34,197,94,0.08); color:#bbf7d0; padding:10px 12px; border-radius: 10px; margin-bottom: 8px }
+        .alert.error{ background: rgba(239,68,68,0.08); color:#fecaca }
+
+        .kicker{ color:#a5b4fc; font-weight:600; letter-spacing:.02em }
+        .small{ font-size:.9em }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="nav">
+            <div class="brand">
+                <span class="logo">📰</span>
+                <span>RSS Proxy Portal</span>
+                {% if current_user.is_authenticated %}
+                <span class="role-badge">{{ current_user.username }} · {{ current_user.role }}</span>
+                {% endif %}
+            </div>
+            <div>
+                <a href="{{ url_for('index') }}">Home</a>
+                {% if is_admin %}<a href="{{ url_for('view_logs') }}" target="_blank">Logs</a>{% endif %}
+                {% if is_admin %}<a href="{{ url_for('manage_users') }}">Users</a>{% endif %}
+                {% if is_admin %}<a href="{{ url_for('settings') }}">Settings</a>{% endif %}
+                {% if current_user.is_authenticated %}
+                    <a href="{{ url_for('change_password') }}">Change Password</a>
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                {% else %}
+                    <a href="{{ url_for('login') }}">Login</a>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="alerts">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert {% if category=='error' %}error{% endif %}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+            {% endwith %}
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h2>Add New Feed</h2>
+                <div class="content">
+                    {% if not is_admin %}
+                        <div class="muted">Only administrators can add feeds. Please login as admin.</div>
+                    {% else %}
+                        <form class="form" action="/add" method="POST">
+                            <label for="path_name">Proxy Path</label>
+                            <input class="input" type="text" id="path_name" name="path_name" placeholder="e.g., RSS-chip.xml (must be unique)" required>
+
+                            <label for="rss_url">Source RSS URL</label>
+                            <input class="input" type="text" id="rss_url" name="rss_url" placeholder="https://example.com/feed.xml" required>
+
+                            <label for="cookie_data">Cookie Data</label>
+                            <textarea class="textarea" id="cookie_data" name="cookie_data" placeholder="Paste raw cookie string, e.g., session=...; user=..."></textarea>
+
+                            <label for="user_agent">User-Agent</label>
+                            <input class="input" type="text" id="user_agent" name="user_agent" placeholder="Optional. Defaults to a standard Chrome User-Agent.">
+
+                            <div style="grid-column: 2">
+                                <button class="btn btn-primary" type="submit">➕ Add Feed</button>
+                            </div>
+                        </form>
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Current Feeds</h2>
+                <div class="content">
+                    {% if feeds %}
+                        <div class="kicker small">{{ feeds|length }} configured feed(s)</div>
+                        <div class="feed-grid" style="margin-top:10px">
+                        {% for feed in feeds %}
+                            <div class="feed-card">
+                                <div class="feed-top">
+                                    <a class="feed-link" href="{{ url_for('serve_feed', path_name=feed.path_name) }}" target="_blank">/feed/{{ feed.path_name }}</a>
+                                    <div class="actions">
+                                        <button class="btn btn-secondary" type="button" onclick="copyLink('/feed/{{ feed.path_name }}')">📋 Copy</button>
+                                        {% if is_admin %}
+                                        <form action="/delete" method="POST" class="delete-form" onsubmit="return confirm('Delete this feed?');">
+                                            <input type="hidden" name="path_name" value="{{ feed.path_name }}">
+                                            <button type="submit" class="btn btn-danger">🗑️ Delete</button>
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                                <div class="feed-url" title="Source URL">{{ feed.rss_url }}</div>
+                            </div>
+                        {% endfor %}
+                        </div>
+                    {% else %}
+                        <div class="muted">No feeds configured yet.</div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:18px">
+            <h2>About</h2>
+            <div class="content">
+                <div class="muted">The proxy fetches feeds periodically and serves cached content for quick access.</div>
+                <div style="margin-top:10px" class="badge">⏱️ Fetch interval: {{ fetch_interval_human }}</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function copyLink(link){
+            try{
+                await navigator.clipboard.writeText(location.origin + link);
+                showToast('Link copied');
+            }catch(e){
+                alert('Copy failed');
+            }
+        }
+        function showToast(msg){
+            const t = document.createElement('div');
+            t.textContent = msg;
+            t.style.position='fixed'; t.style.bottom='20px'; t.style.right='20px';
+            t.style.background='rgba(14,165,233,0.15)'; t.style.color='#93c5fd'; t.style.border='1px solid rgba(14,165,233,0.4)';
+            t.style.padding='10px 12px'; t.style.borderRadius='10px'; t.style.boxShadow='0 6px 16px rgba(0,0,0,0.35)';
+            document.body.appendChild(t);
+            setTimeout(()=>{ t.remove(); }, 1800);
+        }
+    </script>
+</body>
+</html>
